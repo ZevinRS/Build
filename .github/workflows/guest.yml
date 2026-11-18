@@ -1,0 +1,101 @@
+# Builds a guest app (apps/<app> in the private AppHub repo, an XcodeGen project) and publishes
+# it as a release there, where the AppHub tab finds it. Manual only; nothing is published here.
+# A new guest app: add its folder name to the options below.
+name: Guest app
+
+on:
+  workflow_dispatch:
+    inputs:
+      app:
+        description: App folder under apps/ (also its release tag prefix)
+        type: choice
+        options:
+          - canvastutor
+          - hello
+      ref:
+        description: AppHub branch, tag, or commit
+        default: main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: guest-${{ inputs.app }}
+  cancel-in-progress: true
+
+env:
+  SOURCE_REPO: ZevinRS/AppHub
+  # Builds published from this repo are numbered from 101, above the old in-repo builds.
+  BUILD_NUMBER_OFFSET: 100
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 30
+    steps:
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '27.2'
+
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.BUILD_TOKEN }}
+          path: src
+
+      - name: Generate Xcode project
+        working-directory: src/apps/${{ inputs.app }}
+        run: |
+          command -v xcodegen >/dev/null || brew install xcodegen
+          xcodegen generate --quiet
+          # the XcodeGen project name is also the scheme and the .app name
+          scheme=$(sed -n 's/^name: *//p' project.yml | head -1)
+          echo "SCHEME=$scheme" >> "$GITHUB_ENV"
+          echo "BUILD=$((GITHUB_RUN_NUMBER + BUILD_NUMBER_OFFSET))" >> "$GITHUB_ENV"
+
+      - name: Build (unsigned)
+        working-directory: src/apps/${{ inputs.app }}
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project "$SCHEME.xcodeproj" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/dd" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            CURRENT_PROJECT_VERSION=$BUILD \
+            -quiet
+
+      - name: Package IPA and manifest
+        run: |
+          app="$RUNNER_TEMP/dd/Build/Products/Release-iphoneos/$SCHEME.app"
+          work="$(mktemp -d)"
+          mkdir "$work/Payload"
+          cp -R "$app" "$work/Payload/"
+          (cd "$work" && zip -qr app.ipa Payload)
+          mv "$work/app.ipa" "$SCHEME.ipa"
+          plist="$app/Info.plist"
+          pb() { /usr/libexec/PlistBuddy -c "Print :$1" "$plist"; }
+          jq -n \
+            --arg id "${{ inputs.app }}" \
+            --arg name "$(pb CFBundleDisplayName 2>/dev/null || pb CFBundleName)" \
+            --arg bundleID "$(pb CFBundleIdentifier)" \
+            --arg version "$(pb CFBundleShortVersionString)" \
+            --argjson build "$(pb CFBundleVersion)" \
+            '{id: $id, name: $name, bundleID: $bundleID, version: $version, build: $build}' > app.json
+
+      - name: Publish release on the source repo
+        env:
+          GH_TOKEN: ${{ secrets.BUILD_TOKEN }}
+        run: |
+          sha=$(git -C src rev-parse HEAD)
+          tag="${{ inputs.app }}-$(date -u +%Y%m%d-%H%M)-${sha::7}"
+          gh release create "$tag" "$SCHEME.ipa" app.json \
+            -R "$SOURCE_REPO" \
+            --target "$sha" \
+            --latest=false \
+            --title "$SCHEME build $BUILD" \
+            --notes "Install from the AppHub tab in LiveContainer."
