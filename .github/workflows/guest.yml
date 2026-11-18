@@ -11,7 +11,6 @@ on:
         type: choice
         options:
           - canvastutor
-          - hello
       ref:
         description: AppHub branch, tag, or commit
         default: main
