@@ -63,8 +63,9 @@ jobs:
       - name: Generate iOS project
         working-directory: src
         run: |
-          npx tauri icon src-tauri/icons/app-icon.svg > /dev/null
           npx tauri ios init --ci
+          # after init, so the logo replaces the template's placeholder icon in the Xcode project
+          npx tauri icon src-tauri/icons/app-icon-ios.svg > /dev/null
 
       - name: Build (unsigned)
         working-directory: src
