@@ -1,0 +1,70 @@
+# Builds SideStore (public, AGPL-3.0) with patches/sidestore-remote-pairing-port.patch, which
+# finds the RemotePairing port by itself when Bonjour can't (e.g. during a background refresh).
+# The unsigned IPA is published as a release on the private AppHub repo, without an app.json,
+# so the AppHub tab doesn't list it: download it on the PC and install it with iloader.
+name: SideStore
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: SideStore commit the patch applies to
+        default: 4f3d18d98c5fbee72c80f787ceb2e8e09ded60a6
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sidestore
+  cancel-in-progress: true
+
+env:
+  RELEASE_REPO: ZevinRS/AppHub
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 60
+    steps:
+      - name: Check out this repo (for the patch)
+        uses: actions/checkout@v6
+
+      - name: Check out SideStore
+        uses: actions/checkout@v6
+        with:
+          repository: SideStore/SideStore
+          ref: ${{ inputs.ref }}
+          submodules: recursive
+          path: sidestore
+
+      - run: brew install ldid xcbeautify
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '27.2'
+
+      - name: Apply patch and set the version
+        working-directory: sidestore
+        run: |
+          git apply --verbose ../patches/sidestore-remote-pairing-port.patch
+          version="$(python3 scripts/ci/workflow.py get-marketing-version)-apphub.${GITHUB_RUN_NUMBER}"
+          python3 scripts/ci/workflow.py set-marketing-version "$version"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Build
+        working-directory: sidestore
+        run: python3 scripts/ci/workflow.py build
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.BUILD_TOKEN }}
+        run: |
+          sha=$(git -C sidestore rev-parse HEAD)
+          tag="sidestore-$(date -u +%Y%m%d-%H%M)-${sha::7}"
+          mv sidestore/SideStore.ipa "SideStore-$VERSION.ipa"
+          gh release create "$tag" "SideStore-$VERSION.ipa" \
+            -R "$RELEASE_REPO" \
+            --prerelease \
+            --latest=false \
+            --title "SideStore $VERSION" \
+            --notes "SideStore ${sha::7} with the RemotePairing port patch (patches/sidestore-remote-pairing-port.patch in ZevinRS/Build). Install with iloader; not through the AppHub tab."

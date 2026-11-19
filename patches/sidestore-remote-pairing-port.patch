@@ -1,0 +1,178 @@
+diff --git a/SideStore/Core/DeviceApi/MinimuxerWrapper.swift b/SideStore/Core/DeviceApi/MinimuxerWrapper.swift
+index 9dfb2c5..0730b66 100644
+--- a/SideStore/Core/DeviceApi/MinimuxerWrapper.swift
++++ b/SideStore/Core/DeviceApi/MinimuxerWrapper.swift
+@@ -67,7 +67,8 @@ private func resolveDiscoveredRemotePairingPort() async -> UInt16? {
+     }
+     if let resolved = await BonjourDiscoveryManager.resolveFirstService(
+         ofType: AppConstants.Minimuxer.remotePairingDaemonServiceType,
+-        timeout: AppConstants.Bonjour.defaultDiscoveryTimeout,
++        // AppHub: 2 s is often too short, especially during a background refresh
++        timeout: max(AppConstants.Bonjour.defaultDiscoveryTimeout, 6.0),
+         isPreferredCandidate: { res in
+             res.interfaces.contains { $0.name == "lo0" || $0.name.hasPrefix("lo") }
+         }
+@@ -88,11 +89,8 @@ private func resolveDiscoveredRemotePairingPortThrottled() async -> UInt16? {
+         return UInt16(overridePort)
+     }
+ 
+-    let now = Date()
+-    guard now.timeIntervalSince(lastRemotePairingPortResolveTime) > 5.0 else {
+-        return nil
+-    }
+-
++    // AppHub: don't return nil just because a lookup ran in the last few seconds; a refresh that
++    // failed twice in a row would otherwise never get a fresh port. Concurrent lookups still share one.
+     if let inFlight = activeRemotePairingPortResolveTask {
+         return await inFlight.value
+     }
+@@ -139,16 +137,132 @@ private func withRemotePairingRetry<T>(_ operation: () async throws -> T) async
+             throw error
+         }
+ 
+-        if let newPort = await resolveDiscoveredRemotePairingPortThrottled(), newPort != remotePairingPortCache {
++        let failedPort = remotePairingPortCache
++        if let newPort = await resolveDiscoveredRemotePairingPortThrottled(), newPort != failedPort {
+             debugLog("[SideStore] Operation failed with retriable error (\(error)), updating RemotePairing port from \(remotePairingPortCache) -> \(newPort) and retrying...")
+-            remotePairingPortCache = newPort
+-            minimuxer.set(MinimuxerParams(remotePairingPort: newPort))
+-            return try await operation()
++            useRemotePairingPort(newPort)
++            do {
++                return try await operation()
++            } catch let retryError where isRetriableRemotePairingError(retryError) {
++                debugLog("[SideStore] Bonjour port \(newPort) failed too (\(retryError)); scanning")
++            }
++        }
++
++        // AppHub: Bonjour found nothing usable (it often can't browse during a background refresh),
++        // so look for the port on the device itself and try each port that accepts a connection.
++        guard UserDefaults.standard.remotePairingPortOverride == 0 else { throw error }
++        let tried = Set([failedPort, remotePairingPortCache])
++        for port in await scanForRemotePairingPorts() where !tried.contains(port) {
++            debugLog("[SideStore] Trying scanned RemotePairing port \(port)")
++            useRemotePairingPort(port)
++            do {
++                let result = try await operation()
++                UserDefaults.standard.lastDiscoveredRemotePairingPort = Int(port)
++                return result
++            } catch let retryError where isRetriableRemotePairingError(retryError) {
++                continue
++            }
+         }
+         throw error
+     }
+ }
+ 
++private func useRemotePairingPort(_ port: UInt16) {
++    remotePairingPortCache = port
++    minimuxer.set(MinimuxerParams(remotePairingPort: port))
++}
++
++// MARK: - AppHub: finding the RemotePairing port without Bonjour
++
++/// The address the device's own services are reached at through the VPN tunnel.
++private func remotePairingScanHost() -> String {
++    let config = ConnectionConfig.shared
++    let override = config.overrideTunnelPeerIp.trimmingCharacters(in: .whitespacesAndNewlines)
++    if !override.isEmpty { return override }
++    return config.tunnelPeerIp ?? "10.7.0.1"
++}
++
++/// Ports in the dynamic range (where the RemotePairing daemon listens; minimuxer's default is its
++/// first port, 49152) that accept a TCP connection on the device, nearest the last known port first.
++private func scanForRemotePairingPorts() async -> [UInt16] {
++    let host = remotePairingScanHost()
++    let last = UserDefaults.standard.lastDiscoveredRemotePairingPort
++    return await Task.detached(priority: .userInitiated) { () -> [UInt16] in
++        let ports = (UInt16(49152)...UInt16(65535)).filter { $0 != AppConstants.Minimuxer.lockdowndPort }
++        let started = Date()
++        let open = openTCPPorts(host: host, ports: ports, budget: 20)
++        debugLog("[SideStore] RemotePairing port scan of \(host) found \(open) in \(String(format: "%.1f", Date().timeIntervalSince(started))) s")
++        return open.sorted { abs(Int($0) - last) < abs(Int($1) - last) }
++    }.value
++}
++
++/// The ports among `ports` that accept a TCP connection on `host` (IPv4). Non-blocking connects go
++/// out in batches; a closed port answers with a reset straight away, so a batch settles quickly.
++/// Stops early once `budget` seconds have passed.
++private func openTCPPorts(host: String, ports: [UInt16], batch: Int = 128, batchTimeoutMs: Int32 = 400, budget: TimeInterval) -> [UInt16] {
++    var base = sockaddr_in()
++    base.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
++    base.sin_family = sa_family_t(AF_INET)
++    guard inet_pton(AF_INET, host, &base.sin_addr) == 1 else { return [] }
++
++    let deadline = Date().addingTimeInterval(budget)
++    var open: [UInt16] = []
++    var start = 0
++    while start < ports.count, Date() < deadline {
++        let chunk = ports[start..<min(start + batch, ports.count)]
++        start += batch
++
++        var pending: [pollfd] = []
++        var portFor: [Int32: UInt16] = [:]
++        for port in chunk {
++            let fd = socket(AF_INET, SOCK_STREAM, 0)
++            if fd < 0 { continue }
++            var one: Int32 = 1
++            setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
++            _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
++            var addr = base
++            addr.sin_port = port.bigEndian
++            let result = withUnsafePointer(to: &addr) {
++                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
++                    connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
++                }
++            }
++            if result == 0 {
++                open.append(port)
++                close(fd)
++            } else if errno == EINPROGRESS {
++                pending.append(pollfd(fd: fd, events: Int16(POLLOUT), revents: 0))
++                portFor[fd] = port
++            } else {
++                close(fd)
++            }
++        }
++
++        let batchDeadline = Date().addingTimeInterval(Double(batchTimeoutMs) / 1000)
++        while !pending.isEmpty {
++            let left = Int32(batchDeadline.timeIntervalSinceNow * 1000)
++            if left <= 0 || poll(&pending, nfds_t(pending.count), left) <= 0 { break }
++            var still: [pollfd] = []
++            for entry in pending {
++                if entry.revents == 0 {
++                    still.append(entry)
++                    continue
++                }
++                var err: Int32 = 0
++                var len = socklen_t(MemoryLayout<Int32>.size)
++                getsockopt(entry.fd, SOL_SOCKET, SO_ERROR, &err, &len)
++                if err == 0, entry.revents & Int16(POLLOUT) != 0, let port = portFor[entry.fd] {
++                    open.append(port)
++                }
++                close(entry.fd)
++            }
++            pending = still
++        }
++        for entry in pending { close(entry.fd) }
++    }
++    return open
++}
++
+ public var minimuxerStatusPublisher: AnyPublisher<Result<Bool, Error>, Never> {
+     minimuxer.core.statusPublisher
+         .map { result in
+@@ -184,6 +298,12 @@ func bindConnectionConfig() async {
+                         minimuxer.set(MinimuxerParams(remotePairingPort: discovered))
+                         return ServicePort(protocolType: .rppairing, port: discovered)
+                     }
++                    // AppHub: no Bonjour answer; take the open port nearest the last known one
++                    if UserDefaults.standard.remotePairingPortOverride == 0,
++                       let scanned = await scanForRemotePairingPorts().first(where: { $0 != failed.port }) {
++                        useRemotePairingPort(scanned)
++                        return ServicePort(protocolType: .rppairing, port: scanned)
++                    }
+                     return failed
+                 case .lockdown:
+                     return ServicePort(protocolType: .lockdown, port: AppConstants.Minimuxer.lockdowndPort)
