@@ -1,0 +1,63 @@
+# Builds the patched YouTube (apps/youtube in the private AppHub repo) and publishes it as a
+# release there, where the AppHub tab finds it. Manual only; nothing is published here.
+name: YouTube
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: AppHub branch, tag, or commit
+        default: main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: youtube
+  cancel-in-progress: true
+
+env:
+  SOURCE_REPO: ZevinRS/AppHub
+  # private release holding the decrypted app the tweak is applied to
+  BASE_TAG: youtube-base-21.46.3
+  BUILD_NUMBER_OFFSET: 100
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 30
+    steps:
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '27.2'
+
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.BUILD_TOKEN }}
+          path: src
+
+      - name: Download the base app
+        env:
+          GH_TOKEN: ${{ secrets.BUILD_TOKEN }}
+        run: gh release download "$BASE_TAG" -R "$SOURCE_REPO" -p '*.ipa' -O "$RUNNER_TEMP/base.ipa"
+
+      - name: Build
+        run: |
+          echo "BUILD=$((GITHUB_RUN_NUMBER + BUILD_NUMBER_OFFSET))" >> "$GITHUB_ENV"
+          src/apps/youtube/build.sh "$RUNNER_TEMP/base.ipa" "$((GITHUB_RUN_NUMBER + BUILD_NUMBER_OFFSET))" "$RUNNER_TEMP/out"
+
+      - name: Publish release on the source repo
+        env:
+          GH_TOKEN: ${{ secrets.BUILD_TOKEN }}
+        run: |
+          sha=$(git -C src rev-parse HEAD)
+          tag="youtube-$(date -u +%Y%m%d-%H%M)-${sha::7}"
+          gh release create "$tag" "$RUNNER_TEMP/out/YouTube.ipa" "$RUNNER_TEMP/out/app.json" \
+            -R "$SOURCE_REPO" \
+            --target "$sha" \
+            --latest=false \
+            --title "YouTube build $BUILD" \
+            --notes "Install from the AppHub tab in LiveContainer."
